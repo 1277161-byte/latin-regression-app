@@ -1,0 +1,247 @@
+# app.py
+# Streamlit app to fetch historical World Bank data for selected Latin American countries,
+# allow editing, fit a polynomial regression (degree >= 3), and perform function analysis.
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+
+st.set_page_config(layout="wide", page_title="Latin Countries: Historical Regression Explorer")
+
+# --- helper mappings ---
+COUNTRIES = {
+"Chile": "chl",
+"Uruguay": "ury",
+"Panama": "pan",
+"Argentina": "arg",
+"Costa Rica": "cri",
+"Mexico": "mex",
+"Brazil": "bra"
+}
+
+INDICATORS = {
+"Population": "SP.POP.TOTL",
+"Unemployment rate": "SL.UEM.TOTL.ZS",
+"Education levels from 0-25 where 25 is the highest level of education.": "SE.SCH.LIFE",
+"Life expectancy": "SP.DYN.LE00.IN",
+"Average wealth": "NY.GDP.PCAP.CD",
+"Average income": "NY.GNP.PCAP.CD",
+"Birth rate": "SP.DYN.CBRT.IN",
+"Immigration out of the country": "SM.POP.NETM",
+"Murder Rate": "VC.IHR.PSRC.P5"
+}
+
+# --- functions to fetch World Bank data ---
+def fetch_wb(country_code, indicator, start_year=1955, end_year=2025):
+url = (
+f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}"
+f"?date={start_year}:{end_year}&format=json&per_page=2000"
+)
+r = requests.get(url, timeout=20)
+if r.status_code != 200:
+return None
+try:
+data = r.json()
+except Exception:
+return None
+if not isinstance(data, list) or len(data) < 2:
+return None
+rows = data[1]
+records = []
+for item in rows:
+year = item.get("date")
+value = item.get("value")
+if value is None:
+continue
+records.append({"year": int(year), "value": float(value)})
+if not records:
+return None
+df = pd.DataFrame(records).sort_values("year")
+return df
+
+# Format polynomial as human-readable equation
+def poly_to_equation(coefs):
+terms = []
+deg = len(coefs) - 1
+for i, c in enumerate(coefs):
+power = deg - i
+if abs(c) < 1e-12:
+continue
+coeff = f"{c:.6g}"
+if power == 0:
+terms.append(f"{coeff}")
+elif power == 1:
+terms.append(f"{coeff}*x")
+else:
+terms.append(f"{coeff}*x^{power}")
+eq = " + ".join(terms)
+eq = eq.replace("+ -", "- ")
+return f"f(x) = {eq}"
+
+# Function analysis
+def analyze_polynomial(coefs, x_min, x_max):
+p = np.poly1d(coefs)
+dp = p.deriv()
+ddp = dp.deriv()
+crit_roots = np.roots(dp.coeffs)
+crit_real = sorted([float(r.real) for r in crit_roots if abs(r.imag) < 1e-8 and x_min <= r.real <= x_max])
+xs = np.linspace(x_min, x_max, 500)
+ys = p(xs)
+dys = dp(xs)
+ddys = ddp(xs)
+inc_intervals = []
+dec_intervals = []
+sign = np.sign(dys[0])
+start = xs[0]
+for i in range(1, len(xs)):
+s = np.sign(dys[i])
+if s == sign:
+continue
+else:
+end = xs[i]
+if sign > 0:
+inc_intervals.append((start, end))
+elif sign < 0:
+dec_intervals.append((start, end))
+start = end
+sign = s
+if sign > 0:
+inc_intervals.append((start, xs[-1]))
+elif sign < 0:
+dec_intervals.append((start, xs[-1]))
+idx_max_dd = np.argmax(ddys)
+idx_min_dd = np.argmin(ddys)
+fastest_increase_x = float(xs[idx_max_dd])
+fastest_decrease_x = float(xs[idx_min_dd])
+y_min = float(np.min(ys))
+y_max = float(np.max(ys))
+return {
+"critical_points": crit_real,
+"increasing_intervals": inc_intervals,
+"decreasing_intervals": dec_intervals,
+"fastest_increase_x": fastest_increase_x,
+"fastest_decrease_x": fastest_decrease_x,
+"domain": (x_min, x_max),
+"range": (y_min, y_max),
+}
+
+# --- Streamlit UI ---
+st.title("Historical Regression Explorer — Latin Countries")
+st.markdown(
+"Select up to three Latin American countries. Pick a category and degree (3 or higher). "
+"The app fetches World Bank data (1955–2025), shows an editable table, fits a polynomial regression and performs function analysis."
+)
+
+with st.sidebar:
+st.header("Configuration")
+countries = st.multiselect("Choose up to 3 countries", list(COUNTRIES.keys()), default=["Chile", "Uruguay"])
+if len(countries) > 3:
+st.warning("Please select at most 3 countries — only the first three will be used.")
+countries = countries[:3]
+category = st.selectbox("Category", list(INDICATORS.keys()))
+degree = st.slider("Polynomial degree (>=3)", min_value=3, max_value=8, value=3)
+sample_step = st.slider("Regression plot sampling (years step)", min_value=1, max_value=10, value=1)
+start_year = st.number_input("Start year (earliest)", min_value=1900, max_value=2025, value=1955)
+end_year = st.number_input("End year (latest)", min_value=1955, max_value=2025, value=2025)
+refresh = st.button("Fetch / Refresh Data")
+
+if not countries:
+st.info("Choose at least one country on the left to continue.")
+st.stop()
+
+indicator_code = INDICATORS[category]
+st.header(f"Data & Regression — {category}")
+
+# Fetch and assemble data
+all_dfs = {}
+for c in countries:
+code = COUNTRIES[c]
+df = fetch_wb(code, indicator_code, int(start_year), int(end_year))
+if df is None or df.empty:
+st.warning(f"No data found for {c} / {category} over {start_year}-{end_year}")
+continue
+all_dfs[c] = df
+
+if not all_dfs:
+st.error("No usable data found for any selected country and category. Try a different category or countries.")
+st.stop()
+
+merged = None
+for country_name, df in all_dfs.items():
+d = df.copy()
+d = d.rename(columns={"value": country_name})
+if merged is None:
+merged = d
+else:
+merged = pd.merge(merged, d, on="year", how="outer")
+merged = merged.sort_values("year").reset_index(drop=True)
+
+st.subheader("Raw data (editable)")
+st.caption("You can edit values in the table; the regression will use the edited values.")
+try:
+edited = st.data_editor(merged, num_rows="dynamic")
+except Exception:
+edited = st.experimental_data_editor(merged)
+
+model_country = st.selectbox("Select country to build model for:", list(all_dfs.keys()))
+data_for_model = edited[["year", model_country]].dropna()
+if data_for_model.empty or len(data_for_model) < degree + 1:
+st.error(f"Not enough data points for {model_country} to fit degree {degree} polynomial. Need at least degree+1 points.")
+st.stop()
+
+x = data_for_model["year"].values.astype(float)
+y = data_for_model[model_country].values.astype(float)
+
+if "Education levels from 0-25" in category:
+max_obs = np.nanmax(y)
+if max_obs > 0:
+y = y / max_obs * 25
+
+coefs = np.polyfit(x, y, deg=degree)
+p = np.poly1d(coefs)
+
+xs_plot = np.arange(x.min(), x.max() + 1, sample_step)
+ys_plot = p(xs_plot)
+
+st.subheader("Fitted model")
+st.code(poly_to_equation(coefs))
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.scatter(x, y, label="Data points")
+ax.plot(xs_plot, ys_plot, label=f"Degree {degree} fit", linewidth=2)
+ax.set_xlabel("Year")
+ax.set_ylabel(category)
+ax.set_title(f"{model_country}: {category} — degree {degree} polynomial fit")
+ax.legend()
+st.pyplot(fig)
+
+st.subheader("Function analysis (from fitted polynomial)")
+analysis = analyze_polynomial(coefs, float(x.min()), float(x.max()))
+
+st.markdown("**Domain:** {} to {}".format(*analysis["domain"]))
+st.markdown("**Range (approx, on sampled domain):** {:.4g} to {:.4g}".format(*analysis["range"]))
+
+st.markdown("**Critical points (within domain):**")
+if analysis["critical_points"]:
+for cp in analysis["critical_points"]:
+st.write(f"• Year = {cp:.3f}, f(year) = {float(p(cp)):.4g}")
+else:
+st.write("None found within the domain.")
+
+st.markdown("**Intervals where function is increasing (approx):**")
+for a, b in analysis["increasing_intervals"]:
+st.write(f"• {a:.2f} → {b:.2f}")
+
+st.markdown("**Intervals where function is decreasing (approx):**")
+for a, b in analysis["decreasing_intervals"]:
+st.write(f"• {a:.2f} → {b:.2f}")
+
+st.markdown("**Fastest increase (approx) occurs at year:** {:.3f}".format(analysis["fastest_increase_x"]))
+st.markdown("**Fastest decrease (approx) occurs at year:** {:.3f}".format(analysis["fastest_decrease_x"]))
+
+st.markdown("---")
+st.caption(
+"Notes: Data is pulled from the World Bank API at runtime. Some indicators (e.g. homicide rates) may be sparse or use different reporting methodologies."
+)
